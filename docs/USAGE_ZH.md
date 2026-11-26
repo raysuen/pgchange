@@ -1,6 +1,6 @@
 # kbchange 使用手册
 
-版本：v1.0（试用发布）｜ 许可：MIT ｜ English: [USAGE_EN.md](USAGE_EN.md)
+版本：v1.2（试用发布）｜ 许可：MIT ｜ English: [USAGE_EN.md](USAGE_EN.md)
 
 ## 1. 工具是干什么的
 
@@ -58,13 +58,15 @@ kbchange 回答一个问题：**指定时间点之后，这个库里哪些表有
 | `覆盖=partial` / `早于 WAL 起点` | 只覆盖部分区间 | 覆盖外的时间窗**没查**，不可信 |
 | `通路2 未产出结果` | WAL 不可达/解析失败 | 该通路没跑，不能当"无变化" |
 | `N 个未提交事务` | 有事务在跑（孤儿） | 提交后可能翻盘，待其提交后复核 |
+| `N 个两阶段提交` | COMMIT PREPARED（WAL 无提交时间） | 相关表已按"有变化"保守计入，需人工核对 |
+| `覆盖由 full 降级为 partial` | waldump 异常退出/段缺口/输出读取中断 | 实际没读完，覆盖外**没查**，不可信 |
 | `时间线切换（TLI a→b）` | 实例经历过 promote/恢复切换 | 切换前数据已忽略，"无变化"不覆盖切换前窗口 |
 | `通路1 未判定 N 张` | date 精度/NULL 时间列/xmin 不可用 | 这些表通路1 没查成，不能当"无变化" |
 | `另有 N 张文件 mtime…` | 通路4 物理信号 | 不并入合并数；TRUNCATE 只在这里出现；也可能是 VACUUM FULL |
 
 ## 7. 能力与已知局限（实测确认）
 
-**能检出**：INSERT/UPDATE/DELETE、批量 COPY、SAVEPOINT 与回滚、未提交事务（判孤儿不计入、提交后按 COMMIT 时间检出）、分区/INHERITS 父子表（DML 归父表、子表点名不重复）、多级分区、物化视图 REFRESH、TOAST 大字段、DROP 后重建同名表的新写入、净零变化（插入又删光）、纯 DDL 不误报、时间线切换检出。
+**能检出**：INSERT/UPDATE/DELETE、批量 COPY、SAVEPOINT 与回滚、未提交事务（判孤儿不计入、提交后按 COMMIT 时间检出）、两阶段提交（COMMIT PREPARED 无提交时间，相关表按"有变化"保守计入并提示；ABORT PREPARED 判回滚不计入）、分区/INHERITS 父子表（DML 归父表、子表点名不重复）、多级分区、物化视图 REFRESH、TOAST 大字段、DROP 后重建同名表的新写入、净零变化（插入又删光）、纯 DDL 不误报、时间线切换检出。
 
 **检不出/受限**（都有文案兜底，不静默）：
 - **TRUNCATE**：金仓 WAL 无用户表 DML 记录（实为 Storage CREATE 新文件+pg_class 更新），通路2 检不出；通路1 表空、通路3 计数不动。唯一信号是通路4 新文件 mtime。
@@ -98,3 +100,12 @@ go run ./cmd/matrix -dsn "..." -bin ./kbchange -pgdata ... # 全量（含通路4
 ```
 
 矩阵覆盖：表种类（普通/分区/多级分区/INHERITS/视图/物化视图）× 时间列（timestamptz/timestamp/date/NULL/多列/无列）× 事务形状（SAVEPOINT/回滚/TRUNCATE/长事务/批量）× 故障注入（坏 wal 目录/waldump 失败/since 异常/limit 截断）。已在容器环境与金仓 V8R6 集群版双机（含真实 TLI 切换环境）回归通过。
+
+## 11. 更新记录
+
+- **v1.2**
+  - WAL 覆盖判定收紧：waldump 非正常退出、段文件缺口、解析错误、输出行超长读不全——任一成立即把覆盖从 `full` 降为 `partial`，并写明理由，不再"只读了一半却报 full"。
+  - waldump 子进程输出环境固定为 `TZ=UTC`、`LC_ALL=C`、`LANG=C`，不受机器 locale 影响。
+  - 两阶段提交：`COMMIT PREPARED` 的 DML 计入"有变化"（WAL 里没有提交时间，保守计并给提示）；`ABORT PREPARED` 判回滚，不再算孤儿事务。
+- **v1.1**：源码按模块拆分（`internal/wal`、`internal/path1` 等）；集群版 `data_type=USER-DEFINED` 用 `udt_name` 兜底识别时间列；混合时间线自动补 `-t 新TLI`；容器版缺 `udt_name` 列时自动降级查询。
+- **v1.0**：首版四通路。

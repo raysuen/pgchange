@@ -1,6 +1,6 @@
 # kbchange User Manual
 
-Version: v1.0 (trial release) ｜ License: MIT ｜ 中文: [USAGE_ZH.md](USAGE_ZH.md)
+Version: v1.2 (trial release) ｜ License: MIT ｜ 中文: [USAGE_ZH.md](USAGE_ZH.md)
 
 ## 1. What it does
 
@@ -58,13 +58,15 @@ The conclusion is the single entry point. **"Changed" is trustworthy; "no change
 | `覆盖=partial` / earlier than WAL start | Only part of the window was read | No — the uncovered window was not checked |
 | `通路2 未产出结果` | WAL unreachable / parse failed | That path did not run |
 | `N 个未提交事务` | Transactions in flight (orphans) | May flip after commit; re-check afterwards |
+| `N 个两阶段提交` | COMMIT PREPARED (no commit timestamp in WAL) | Related tables conservatively counted as changed; verify manually |
+| `覆盖由 full 降级为 partial` | waldump exited abnormally / segment gap / output read interrupted | WAL not fully read; outside coverage is unchecked |
 | `时间线切换（TLI a→b）` | Instance went through a promote/recovery switch | Pre-switch data ignored; "no change" does not cover it |
 | `通路1 未判定 N 张` | date precision / NULL values / xmin unavailable | Path 1 did not check those tables |
 | `另有 N 张文件 mtime…` | Path-4 physical signal | Not merged; TRUNCATE only appears here; may be VACUUM FULL |
 
 ## 7. Capabilities and known limitations (verified by testing)
 
-**Detected**: INSERT/UPDATE/DELETE, bulk COPY, SAVEPOINT and rollbacks, in-flight transactions (orphans until COMMIT, then located by commit time), partitioned/INHERITS parent tables (child DML attributed to the parent; named children not double-counted), multi-level partitions, materialized-view REFRESH, TOAST values, new writes after DROP+recreate of a same-named table, net-zero changes (insert then delete), pure DDL (no false positives), timeline-switch detection.
+**Detected**: INSERT/UPDATE/DELETE, bulk COPY, SAVEPOINT and rollbacks, in-flight transactions (orphans until COMMIT, then located by commit time), two-phase commits (COMMIT PREPARED has no timestamp in WAL — related tables are conservatively counted as changed with a hint; ABORT PREPARED counts as rollback), partitioned/INHERITS parent tables (child DML attributed to the parent; named children not double-counted), multi-level partitions, materialized-view REFRESH, TOAST values, new writes after DROP+recreate of a same-named table, net-zero changes (insert then delete), pure DDL (no false positives), timeline-switch detection.
 
 **Not detected / limited** (always surfaced in warnings, never silent):
 - **TRUNCATE**: KingbaseES writes no user-table DML record (it is a Storage CREATE of a new file plus a pg_class update); path 2 cannot see it, path 1 sees an empty table, path 3 counters do not move. The only signal is the path-4 mtime of the new file.
@@ -98,3 +100,12 @@ go run ./cmd/matrix -dsn "..." -bin ./kbchange -pgdata ... # full (incl. path-4 
 ```
 
 The matrix crosses table kinds (plain/range-partitioned/multi-level/INHERITS/views/matviews) × time columns × transaction shapes × fault injection. Regression passes on both a containerized instance and a real two-node KingbaseES V8R6 cluster (including one node with a genuine timeline switch).
+
+## 11. Change log
+
+- **v1.2**
+  - Stricter WAL coverage verdict: abnormal waldump exit, missing WAL segments, parse errors, or an over-long line that could not be read in full — any of these downgrades coverage from `full` to `partial`, with the reason printed. No more "read half the WAL but reported full".
+  - The waldump child process is pinned to `TZ=UTC`, `LC_ALL=C`, `LANG=C`, so machine locale cannot affect output.
+  - Two-phase commit: DML closed by `COMMIT PREPARED` counts as a change (WAL carries no commit timestamp, so it is counted conservatively with a note); `ABORT PREPARED` is treated as rolled back and no longer reported as an orphan transaction.
+- **v1.1**: source split into modules (`internal/wal`, `internal/path1`, …); `data_type=USER-DEFINED` on the cluster edition handled via `udt_name`; mixed timelines auto-pass `-t <newTLI>`; automatic fallback when `udt_name` column is absent (container edition).
+- **v1.0**: first release with four paths.

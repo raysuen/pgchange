@@ -305,6 +305,13 @@ func BuildConclusion(r Report) string {
 	if r.Path2.Enabled && r.Path2.Available && r.Path2.OrphanTx > 0 {
 		base += fmt.Sprintf("；通路2 检到 %d 个未提交事务（%d 条目标表 DML，事务运行中），提交后可能新增变化表，'无变化'需待其提交后复核", r.Path2.OrphanTx, r.Path2.OrphanDML)
 	}
+	// 两阶段提交：COMMIT PREPARED 在 WAL 里没有提交时间戳，无法按时间判定。
+	// 这些表按"有变化"保守计入（宁多报不漏报），结论必须说明这一点，
+	// 否则"计入"和"按时间定位"的对外口径对不上。
+	if r.Path2.Enabled && r.Path2.PreparedTx > 0 {
+		base += fmt.Sprintf("；通路2 检到 %d 个两阶段提交事务（%s），提交时间无法从 WAL 确定，相关表已按'有变化'保守计入（含未决/已回滚部分的可能误报），需人工核对",
+			r.Path2.PreparedTx, strings.Join(r.Path2.PreparedTables, "、"))
+	}
 	// 时间线切换：切换前数据已整段忽略（旧时间线的 COMMIT 分不清真实写入与被撤回的事务）。
 	// 漏了这句，"无变化"会被读成"切换前也没写入"——实际那段时间根本没查。
 	// 不要求 Available：即使 waldump 全失败，切换事件本身已经成立，照样要提示。

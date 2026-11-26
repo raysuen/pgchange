@@ -78,7 +78,7 @@ func TestPrintExampleOutput(t *testing.T) {
 				{Table: "public.stock_log", Ins: 0, Upd: 0, Del: 9, LastLSN: "0/1A2B9F0"},
 			},
 		},
-		Path2Note: "只读解析 WAL：COMMIT 时间定位事务，DML 行取 relfilenode 映射表名（分区/INHERITS 父表把子表 DML 归到父表名下），覆盖 Heap 增删改（含 Kingbase INPLACE 原地改、COPY 的 MULTI_INSERT）；SAVEPOINT 子事务按父事务 COMMIT 行的 subxacts 归并、回滚事务(ABORT)不计入；先探覆盖区间，段被回收/无提交/孤儿事务(有 DML 但既无 COMMIT 也无 ABORT)会告警；TRUNCATE/DROP 等改 relfilenode 的 DDL 不在覆盖范围",
+		Path2Note: "只读解析 WAL：COMMIT 时间定位事务，DML 行取 relfilenode 映射表名（分区/INHERITS 父表把子表 DML 归到父表名下），覆盖 Heap 增删改（含 Kingbase INPLACE 原地改、COPY 的 MULTI_INSERT）；SAVEPOINT 子事务按父事务 COMMIT 行的 subxacts 归并、回滚事务(ABORT)不计入；两阶段提交(COMMIT PREPARED 无提交时间)按'有变化'保守计入并提示；先探覆盖区间，段被回收/无提交/孤儿事务(有 DML 但既无 COMMIT 也无 ABORT)会告警，waldump 异常退出/段缺口/读取中断会把覆盖从 full 降级为 partial；TRUNCATE/DROP 等改 relfilenode 的 DDL 不在覆盖范围",
 	}
 	r.Conclusion = BuildConclusion(r)
 

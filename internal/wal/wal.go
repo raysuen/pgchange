@@ -59,6 +59,10 @@ type WalCheckReport struct {
 	// SubxactMerged：按 COMMIT 行 subxacts 列表归并到父事务的子事务个数。
 	// 这些子事务的 DML 已按父事务的提交时间判定，不再算孤儿。
 	SubxactMerged int `json:"subxact_merged"`
+	// PreparedTx/PreparedTables：两阶段提交（COMMIT PREPARED）事务数与涉及的目标表。
+	// WAL 无提交时间，这些表按"有变化"保守计入，结论层会提示人工核对。
+	PreparedTx     int      `json:"prepared_tx"`
+	PreparedTables []string `json:"prepared_tables,omitempty"`
 	// TLI：检测到的时间线切换（脑裂/恢复后 promote 会产生新时间线）。
 	// 旧时间线的 COMMIT 记录无法区分"真实写入"与"切换时被撤回的事务"，
 	// 按口径整段忽略：只扫新时间线，切换信息暴露给告警。
@@ -97,9 +101,12 @@ var (
 	// 实测 BEGIN; SAVEPOINT s1; INSERT; RELEASE s1; COMMIT 的行确实入库，
 	// 但通路2 报 0 张变化 + 孤儿告警（假阴性）。
 	reSubxacts = regexp.MustCompile(`subxacts:\s*([0-9][0-9,\s]*)`)
-	// 回滚记录：desc: ABORT 2026-11-17 13:53:59.026899 UTC
+	// 回滚记录：desc: ABORT 2026-11-17 13:53:59.026899 UTC（ABORT PREPARED 同样命中 \b）
 	// 回滚掉的 DML 本来就不算变化，当成"找不到 COMMIT 的孤儿"报"可能低估"是误报。
 	reAbort = regexp.MustCompile(`desc:\s*ABORT\b`)
+	// 两阶段提交：desc: COMMIT PREPARED 1234 —— 没有提交时间戳，reCommit 匹配不上。
+	// 不单独认出来，prepared 事务的目标表 DML 会永远落进孤儿、通路2 假阴性。
+	reCommitPrepared = regexp.MustCompile(`desc:\s*COMMIT PREPARED\b`)
 )
 
 // LocateWALDir 定位 WAL 目录：
@@ -397,14 +404,17 @@ func (k WalDMLKey) relKey() string {
 // WalScanResult 一次完整扫描的中间结果。
 
 type WalScanResult struct {
-	Commits   map[uint32]time.Time // tx -> 提交时间（含随父事务提交的子事务 xid）
-	CommitMin time.Time
-	CommitMax time.Time
-	Aborted   map[uint32]bool                // tx -> 已回滚
-	DMLByTx   map[uint32]map[WalDMLKey]int64 // tx -> (表+操作) -> 次数
-	LastLSN   map[WalDMLKey]string           // 表+操作 -> 最后一条 LSN，便于回查
-	Scanned   int
-	ParseErrs int
+	Commits map[uint32]time.Time // tx -> 提交时间（含随父事务提交的子事务 xid）
+	// CommitsPrepared：两阶段提交（COMMIT PREPARED）的 xid。WAL 里没有提交时间，
+	// 这些事务的目标表 DML 按"有变化"保守计入（宁多报不漏报），不算孤儿。
+	CommitsPrepared map[uint32]bool
+	CommitMin       time.Time
+	CommitMax       time.Time
+	Aborted         map[uint32]bool                // tx -> 已回滚
+	DMLByTx         map[uint32]map[WalDMLKey]int64 // tx -> (表+操作) -> 次数
+	LastLSN         map[WalDMLKey]string           // 表+操作 -> 最后一条 LSN，便于回查
+	Scanned         int
+	ParseErrs       int
 	// SubxactMerged：从 COMMIT 行的 subxacts 列表归并进来的子事务个数。
 	SubxactMerged int
 }
@@ -430,111 +440,130 @@ func LsnValue(s string) uint64 {
 
 func ScanWaldumpOutput(r io.Reader, loc *time.Location, currentDBOID uint32, allowedKeys map[string]bool) WalScanResult {
 	res := WalScanResult{
-		Commits: map[uint32]time.Time{},
-		Aborted: map[uint32]bool{},
-		DMLByTx: map[uint32]map[WalDMLKey]int64{},
-		LastLSN: map[WalDMLKey]string{},
+		Commits:         map[uint32]time.Time{},
+		Aborted:         map[uint32]bool{},
+		CommitsPrepared: map[uint32]bool{},
+		DMLByTx:         map[uint32]map[WalDMLKey]int64{},
+		LastLSN:         map[WalDMLKey]string{},
 	}
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // 单行 inval 明细可能很长
-	for sc.Scan() {
-		line := sc.Text()
-		m := reWALRecord.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		res.Scanned++
-		tx, err := strconv.ParseUint(m[2], 10, 32)
-		if err != nil {
-			continue
-		}
-		rmgr := m[1]
-
-		if rmgr == "Transaction" {
-			if cm := reCommit.FindStringSubmatch(line); cm != nil {
-				t, err := ParseCommitTime(cm[1], cm[2], loc)
-				if err != nil {
-					res.ParseErrs++
-					continue
-				}
-				res.Commits[uint32(tx)] = t
-				// 同一事务里开的子事务（SAVEPOINT）如果提交了，COMMIT 行会在 subxacts 里列出来。
-				// 它们的 DML 记的是子事务 xid，不认这批 xid 就会全部落进"孤儿"、进而漏报。
-				for _, sub := range ParseSubxactList(line) {
-					if _, dup := res.Commits[sub]; dup {
-						continue
-					}
-					res.Commits[sub] = t
-					res.SubxactMerged++
-				}
-				if res.CommitMin.IsZero() || t.Before(res.CommitMin) {
-					res.CommitMin = t
-				}
-				if t.After(res.CommitMax) {
-					res.CommitMax = t
-				}
-				continue
+	sc := bufio.NewReaderSize(r, 256*1024)
+	for {
+		line, rerr := sc.ReadString('\n')
+		line = strings.TrimRight(line, "\r\n")
+		processWALLine(line, &res, loc, currentDBOID, allowedKeys)
+		if rerr != nil {
+			// 读取中断（管道断开等）意味着后面的 WAL 没读到——调用方据此把覆盖降级。
+			// 用 ReadString 而不是 bufio.Scanner：Scanner 单行超限（默认 4MB）会直接停止，
+			// 超大行（一条记录塞了几 MB 的 inval 明细）后面的 WAL 就全丢了，还只记一次错误。
+			if rerr != io.EOF {
+				res.ParseErrs++
 			}
-			if reAbort.MatchString(line) {
-				res.Aborted[uint32(tx)] = true
-			}
-			continue
+			break
 		}
-
-		if rmgr != "Heap" && rmgr != "Heap2" {
-			continue
-		}
-		op := ""
-		rawOp := ""
-		if om := reHeapOp.FindStringSubmatch(line); om != nil {
-			rawOp = om[1]
-			switch om[1] {
-			case "INSERT", "MULTI_INSERT":
-				op = "ins"
-			case "UPDATE", "HOT_UPDATE", "INPLACE":
-				// INPLACE 是 Kingbase 的原地 UPDATE（不产生新 tuple 版本），按改计数。
-				op = "upd"
-			case "DELETE":
-				op = "del"
-			}
-		}
-		if op == "" {
-			continue
-		}
-		rel := reWALRel.FindStringSubmatch(line)
-		if rel == nil {
-			continue
-		}
-		dbOID, _ := strconv.ParseUint(rel[2], 10, 32)
-		tsOID, _ := strconv.ParseUint(rel[1], 10, 32)
-		relFile, _ := strconv.ParseUint(rel[3], 10, 32)
-		if currentDBOID != 0 && uint32(dbOID) != currentDBOID {
-			continue
-		}
-		key := WalDMLKey{DBOID: uint32(dbOID), TS: uint32(tsOID), RelFile: uint32(relFile), Op: op}
-		if allowedKeys != nil && !allowedKeys[key.relKey()] {
-			continue
-		}
-		cnt := int64(1)
-		if rawOp == "MULTI_INSERT" {
-			if nm := reMultiInsertNum.FindStringSubmatch(line); nm != nil {
-				if n, err := strconv.ParseInt(nm[1], 10, 64); err == nil && n > 0 {
-					cnt = n
-				}
-			}
-		}
-		if res.DMLByTx[uint32(tx)] == nil {
-			res.DMLByTx[uint32(tx)] = map[WalDMLKey]int64{}
-		}
-		res.DMLByTx[uint32(tx)][key] += cnt
-		if old := res.LastLSN[key]; old == "" || LsnValue(m[3]) > LsnValue(old) {
-			res.LastLSN[key] = m[3]
-		}
-	}
-	if err := sc.Err(); err != nil {
-		res.ParseErrs++
 	}
 	return res
+}
+
+// processWALLine 处理单行 waldump 输出。行可以任意长，超长也不会中断扫描。
+func processWALLine(line string, res *WalScanResult, loc *time.Location, currentDBOID uint32, allowedKeys map[string]bool) {
+	m := reWALRecord.FindStringSubmatch(line)
+	if m == nil {
+		return
+	}
+	res.Scanned++
+	tx, err := strconv.ParseUint(m[2], 10, 32)
+	if err != nil {
+		return
+	}
+	rmgr := m[1]
+
+	if rmgr == "Transaction" {
+		if cm := reCommit.FindStringSubmatch(line); cm != nil {
+			t, err := ParseCommitTime(cm[1], cm[2], loc)
+			if err != nil {
+				res.ParseErrs++
+				return
+			}
+			res.Commits[uint32(tx)] = t
+			// 同一事务里开的子事务（SAVEPOINT）如果提交了，COMMIT 行会在 subxacts 里列出来。
+			// 它们的 DML 记的是子事务 xid，不认这批 xid 就会全部落进"孤儿"、进而漏报。
+			for _, sub := range ParseSubxactList(line) {
+				if _, dup := res.Commits[sub]; dup {
+					continue
+				}
+				res.Commits[sub] = t
+				res.SubxactMerged++
+			}
+			if res.CommitMin.IsZero() || t.Before(res.CommitMin) {
+				res.CommitMin = t
+			}
+			if t.After(res.CommitMax) {
+				res.CommitMax = t
+			}
+			return
+		}
+		if reCommitPrepared.MatchString(line) {
+			// 两阶段提交：COMMIT PREPARED 行没有提交时间戳。
+			// 单独记入 CommitsPrepared：DML 按"有变化"保守计入（时间未知），不算孤儿。
+			res.CommitsPrepared[uint32(tx)] = true
+			return
+		}
+		if reAbort.MatchString(line) {
+			// ABORT / ABORT PREPARED 都算回滚：DML 不计入变化，也不算孤儿。
+			res.Aborted[uint32(tx)] = true
+		}
+		return
+	}
+
+	if rmgr != "Heap" && rmgr != "Heap2" {
+		return
+	}
+	op := ""
+	rawOp := ""
+	if om := reHeapOp.FindStringSubmatch(line); om != nil {
+		rawOp = om[1]
+		switch om[1] {
+		case "INSERT", "MULTI_INSERT":
+			op = "ins"
+		case "UPDATE", "HOT_UPDATE", "INPLACE":
+			// INPLACE 是 Kingbase 的原地 UPDATE（不产生新 tuple 版本），按改计数。
+			op = "upd"
+		case "DELETE":
+			op = "del"
+		}
+	}
+	if op == "" {
+		return
+	}
+	rel := reWALRel.FindStringSubmatch(line)
+	if rel == nil {
+		return
+	}
+	dbOID, _ := strconv.ParseUint(rel[2], 10, 32)
+	tsOID, _ := strconv.ParseUint(rel[1], 10, 32)
+	relFile, _ := strconv.ParseUint(rel[3], 10, 32)
+	if currentDBOID != 0 && uint32(dbOID) != currentDBOID {
+		return
+	}
+	key := WalDMLKey{DBOID: uint32(dbOID), TS: uint32(tsOID), RelFile: uint32(relFile), Op: op}
+	if allowedKeys != nil && !allowedKeys[key.relKey()] {
+		return
+	}
+	cnt := int64(1)
+	if rawOp == "MULTI_INSERT" {
+		if nm := reMultiInsertNum.FindStringSubmatch(line); nm != nil {
+			if n, err := strconv.ParseInt(nm[1], 10, 64); err == nil && n > 0 {
+				cnt = n
+			}
+		}
+	}
+	if res.DMLByTx[uint32(tx)] == nil {
+		res.DMLByTx[uint32(tx)] = map[WalDMLKey]int64{}
+	}
+	res.DMLByTx[uint32(tx)][key] += cnt
+	if old := res.LastLSN[key]; old == "" || LsnValue(m[3]) > LsnValue(old) {
+		res.LastLSN[key] = m[3]
+	}
 }
 
 // RelfilenodeMap 只读查 pg_class，把 relfilenode 映射回 schema.table。
@@ -607,6 +636,31 @@ func DecideWALCoverage(since time.Time, sinceLoc *time.Location, commitMin, comm
 	return WalFull, sinceText, ""
 }
 
+// FullCoverageBlocked 列出阻止"覆盖=full 成立"的理由（空切片 = full 可信）。
+// 三个来源：waldump 非正常退出（只解析到中途）、段缺口（中间的提交丢了）、
+// 输出读取中断（后面的 WAL 没读到）。benignExit 是读到 WAL 末尾的正常收尾，不算。
+func FullCoverageBlocked(waldumpErr string, benignExit bool, gapCount, parseErrs int) []string {
+	var reasons []string
+	if waldumpErr != "" && !benignExit {
+		reasons = append(reasons, "waldump 异常退出，只解析到中途，其后 WAL 未读取")
+	}
+	if gapCount > 0 {
+		reasons = append(reasons, fmt.Sprintf("WAL 段有 %d 处缺口，缺口内的提交丢失", gapCount))
+	}
+	if parseErrs > 0 {
+		reasons = append(reasons, "waldump 输出读取中断，其后内容未解析")
+	}
+	return reasons
+}
+
+// PreparedWarningText 把两阶段提交计数写成告警文案；没有则返回空。
+func PreparedWarningText(commitsPrepared map[uint32]bool) string {
+	if len(commitsPrepared) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("检到 %d 个两阶段提交（COMMIT PREPARED，无提交时间戳），其目标表 DML 按'有变化'保守计入", len(commitsPrepared))
+}
+
 // ParseSubxactList 取 COMMIT 行里 subxacts 后面的子事务 xid 列表。
 // 实测两种分隔写法都有："subxacts: 973, 974" / "subxacts: 973 974"。
 // 解析不出来就返回 nil——比乱猜一个 xid 安全。
@@ -635,12 +689,16 @@ func ParseSubxactList(line string) []uint32 {
 // 抽成纯函数：覆盖判定的 none 分支（一条 COMMIT 都没有）也要计数，
 // 否则"有 DML 但全无 COMMIT"这个最关键的信号会被 none 的提前 return 吞掉。
 
-func CountOrphans(dmlByTx map[uint32]map[WalDMLKey]int64, commits map[uint32]time.Time, aborted map[uint32]bool) (tx int, dml int) {
+func CountOrphans(dmlByTx map[uint32]map[WalDMLKey]int64, commits map[uint32]time.Time, aborted map[uint32]bool, prepared map[uint32]bool) (tx int, dml int) {
 	for t, dmls := range dmlByTx {
 		if _, ok := commits[t]; ok {
 			continue
 		}
 		if aborted[t] {
+			continue
+		}
+		if prepared[t] {
+			// 两阶段提交已完成（提交时间未知）：不算孤儿，由调用方按"有变化"计入。
 			continue
 		}
 		tx++
@@ -896,11 +954,16 @@ func CheckPath2(db *sql.DB, walOverride, waldumpBin string, loaderRoot string, s
 	// 否则宿主机 TZ（如 Asia/Shanghai）会盖掉这里的 UTC。
 	var cleanEnv []string
 	for _, e := range os.Environ() {
-		if !strings.HasPrefix(e, "TZ=") {
-			cleanEnv = append(cleanEnv, e)
+		// TZ 影响提交时间的解析（waldump 打的是 UTC 时间，配 TZ=UTC 锁死）；
+		// LANG/LC_* 影响 waldump 的消息语言（gettext）。实测 V009 的记录行
+		//（rmgr/desc/COMMIT）在 zh_CN 下不变，但翻译目录存在、不同版本可能不同——
+		// 锁成 C 消除整类不确定性，零成本。
+		if strings.HasPrefix(e, "TZ=") || strings.HasPrefix(e, "LANG=") || strings.HasPrefix(e, "LC_") {
+			continue
 		}
+		cleanEnv = append(cleanEnv, e)
 	}
-	cmd.Env = append(cleanEnv, "TZ=UTC")
+	cmd.Env = append(cleanEnv, "TZ=UTC", "LANG=C", "LC_ALL=C")
 
 	// 时间线切换告警：切换前数据已按口径忽略，必须显式说清楚，不能静默缩小扫描范围。
 	// 提前构造——waldump 全失败的提前 return 也要带上它，切换信息不能因为解析挂了就消失。
@@ -945,23 +1008,35 @@ func CheckPath2(db *sql.DB, walOverride, waldumpBin string, loaderRoot string, s
 	r.Available = true
 
 	// 4. 覆盖判定
-	if len(scan.Commits) == 0 {
+	// 只有常规 COMMIT 参与时间区间/覆盖判定；两阶段提交（无时间戳）单独走"保守计入"。
+	if len(scan.Commits) == 0 && len(scan.CommitsPrepared) == 0 {
 		r.Coverage = WalNone
 		// 一条 COMMIT 都没有时，目标表 DML 全是孤儿，必须在这里就计数——
 		// 否则第五轮加的孤儿告警被这个提前 return 吞掉，最该报的场景反而静默。
-		r.OrphanTx, r.OrphanDML = CountOrphans(scan.DMLByTx, scan.Commits, scan.Aborted)
+		r.OrphanTx, r.OrphanDML = CountOrphans(scan.DMLByTx, scan.Commits, scan.Aborted, scan.CommitsPrepared)
 		w := "WAL 中没有可解析的 COMMIT 记录，无法判定指定时点后的变化（段可能被回收或无提交）"
 		if r.Scanned > 0 {
 			w += fmt.Sprintf("（已扫 %d 条记录，解析失败 %d 条）", r.Scanned, scan.ParseErrs)
 		}
-		r.Warning = JoinWarn(tliWarn, waldumpErr, w, OrphanWarningText(r.OrphanTx, r.OrphanDML))
+		r.Warning = JoinWarn(tliWarn, waldumpErr, w, PreparedWarningText(scan.CommitsPrepared), OrphanWarningText(r.OrphanTx, r.OrphanDML))
 		r.Note += "；" + r.Warning
 		return r
 	}
-	r.RangeStart = scan.CommitMin.In(sinceLoc).Format("2006-01-02 15:04:05")
-	r.RangeEnd = scan.CommitMax.In(sinceLoc).Format("2006-01-02 15:04:05")
+	if !scan.CommitMin.IsZero() {
+		r.RangeStart = scan.CommitMin.In(sinceLoc).Format("2006-01-02 15:04:05")
+		r.RangeEnd = scan.CommitMax.In(sinceLoc).Format("2006-01-02 15:04:05")
+	}
 	var covWarn string
 	r.Coverage, r.CompareFrom, covWarn = DecideWALCoverage(since, sinceLoc, scan.CommitMin, scan.CommitMax)
+	// full 只在"无段缺口、waldump 干净退出、输出完整读完"时成立。
+	// 任何一种不完整都降级 partial——否则"只解析了一半却报 full"违背 full 的定义，
+	// 只看 coverage/changed_tables 字段就会得出错误的"确认无变化"。
+	if r.Coverage == WalFull {
+		if reasons := FullCoverageBlocked(waldumpErr, benignExit, len(segGaps), scan.ParseErrs); len(reasons) > 0 {
+			r.Coverage = WalPartial
+			covWarn = JoinWarn(covWarn, "覆盖由 full 降级为 partial："+strings.Join(reasons, "；"))
+		}
+	}
 	var gapWarn string
 	if len(segGaps) > 0 {
 		gapWarn = "WAL 段不连续：" + strings.Join(segGaps, "；")
@@ -973,31 +1048,42 @@ func CheckPath2(db *sql.DB, walOverride, waldumpBin string, loaderRoot string, s
 	}
 	var parseWarn string
 	if scan.ParseErrs > 0 {
-		parseWarn = fmt.Sprintf("waldump 行解析失败 %d 条", scan.ParseErrs)
+		parseWarn = fmt.Sprintf("waldump 输出读取中断 %d 次，其后内容未解析", scan.ParseErrs)
+	}
+	if pw := PreparedWarningText(scan.CommitsPrepared); pw != "" {
+		parseWarn = JoinWarn(parseWarn, pw)
 	}
 	r.Warning = JoinWarn(tliWarn, waldumpErr, covWarn, gapWarn, segWarn, parseWarn)
 	if r.Warning != "" {
 		r.Note += "；" + r.Warning
 	}
 
-	// 5. 汇总：事务提交时间 > since 的 DML 才算变化。
+	// 5. 汇总：常规事务按"提交时间 > since"判定；两阶段提交（时间未知）保守计入。
 	// 匹配不到 COMMIT 的事务单独计数并告警，不静默丢弃——
 	// 子事务（COMMIT 在顶层 xid）、COMMIT 段被回收都会落到这里，静默=漏报。
 	agg := map[string]*WalTableDML{}
-	r.OrphanTx, r.OrphanDML = CountOrphans(scan.DMLByTx, scan.Commits, scan.Aborted)
+	preparedTables := map[string]bool{}
+	r.OrphanTx, r.OrphanDML = CountOrphans(scan.DMLByTx, scan.Commits, scan.Aborted, scan.CommitsPrepared)
 	r.SubxactMerged = scan.SubxactMerged
 	for tx, dmls := range scan.DMLByTx {
 		ct, hasCommit := scan.Commits[tx]
+		prepared := scan.CommitsPrepared[tx]
 		if !hasCommit {
-			continue
-		}
-		if !ct.After(since) {
+			if !prepared {
+				continue // 孤儿：无 COMMIT、无 ABORT、非两阶段——已告警，不静默丢弃
+			}
+			// 两阶段提交：WAL 无时间戳，按"有变化"保守计入（宁多报不漏报）。
+			r.PreparedTx++
+		} else if !ct.After(since) {
 			continue
 		}
 		for k, cnt := range dmls {
 			name, ok := rfOwner[k.relKey()]
 			if !ok {
 				continue
+			}
+			if prepared {
+				preparedTables[name] = true
 			}
 			a := agg[name]
 			if a == nil {
@@ -1019,6 +1105,13 @@ func CheckPath2(db *sql.DB, walOverride, waldumpBin string, loaderRoot string, s
 	}
 	for _, a := range agg {
 		r.Changed = append(r.Changed, *a)
+	}
+	if len(preparedTables) > 0 {
+		r.PreparedTables = make([]string, 0, len(preparedTables))
+		for name := range preparedTables {
+			r.PreparedTables = append(r.PreparedTables, name)
+		}
+		sort.Strings(r.PreparedTables)
 	}
 	sort.Slice(r.Changed, func(i, j int) bool { return r.Changed[i].Table < r.Changed[j].Table })
 	r.ChangedCount = len(r.Changed)

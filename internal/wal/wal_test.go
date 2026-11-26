@@ -313,7 +313,7 @@ func TestCountOrphansNoCommitAtAll(t *testing.T) {
 		30: {WalDMLKey{DBOID: 16384, TS: 1663, RelFile: 2615, Op: "ins"}: 2},
 		31: {WalDMLKey{DBOID: 16384, TS: 1663, RelFile: 2615, Op: "del"}: 1},
 	}
-	tx, n := CountOrphans(dml, map[uint32]time.Time{}, nil) // 空 commits
+	tx, n := CountOrphans(dml, map[uint32]time.Time{}, nil, nil) // 空 commits
 	if tx != 2 || n != 3 {
 		t.Errorf("全无 COMMIT: want tx=2 dml=3, got tx=%d dml=%d", tx, n)
 	}
@@ -322,7 +322,7 @@ func TestCountOrphansNoCommitAtAll(t *testing.T) {
 		t.Errorf("孤儿告警应提示可能低估, got %q", w)
 	}
 	// 有 COMMIT 的事务不算孤儿。
-	tx, n = CountOrphans(dml, map[uint32]time.Time{30: time.Now()}, nil)
+	tx, n = CountOrphans(dml, map[uint32]time.Time{30: time.Now()}, nil, nil)
 	if tx != 1 || n != 1 {
 		t.Errorf("tx30 有COMMIT后: want tx=1 dml=1, got tx=%d dml=%d", tx, n)
 	}
@@ -398,7 +398,7 @@ rmgr: Transaction len (rec/tot):     46/    46, tx:        972, lsn: 0/061F0758,
 	if res.SubxactMerged != 1 {
 		t.Errorf("SubxactMerged = %d, want 1", res.SubxactMerged)
 	}
-	if tx, dml := CountOrphans(res.DMLByTx, res.Commits, res.Aborted); tx != 0 || dml != 0 {
+	if tx, dml := CountOrphans(res.DMLByTx, res.Commits, res.Aborted, res.CommitsPrepared); tx != 0 || dml != 0 {
 		t.Errorf("已归并的子事务不该算孤儿, got tx=%d dml=%d", tx, dml)
 	}
 	// 冒号后多个 subxact、逗号分隔也要认。
@@ -430,14 +430,14 @@ rmgr: Transaction len (rec/tot):     34/    34, tx:        971, lsn: 0/061F0598,
 	if _, ok := res.Commits[971]; ok {
 		t.Error("ABORT 不该被当成 COMMIT")
 	}
-	if tx, dml := CountOrphans(res.DMLByTx, res.Commits, res.Aborted); tx != 0 || dml != 0 {
+	if tx, dml := CountOrphans(res.DMLByTx, res.Commits, res.Aborted, res.CommitsPrepared); tx != 0 || dml != 0 {
 		t.Errorf("回滚事务不该算孤儿, got tx=%d dml=%d", tx, dml)
 	}
 	// 真孤儿（既无 COMMIT 也无 ABORT）仍要报。
 	dml := map[uint32]map[WalDMLKey]int64{
 		40: {WalDMLKey{DBOID: 16384, TS: 1663, RelFile: 2615, Op: "ins"}: 1},
 	}
-	if tx, n := CountOrphans(dml, map[uint32]time.Time{}, map[uint32]bool{}); tx != 1 || n != 1 {
+	if tx, n := CountOrphans(dml, map[uint32]time.Time{}, map[uint32]bool{}, nil); tx != 1 || n != 1 {
 		t.Errorf("真孤儿应保留, got tx=%d dml=%d", tx, n)
 	}
 }
@@ -550,5 +550,83 @@ func TestTLISplitMultiGenerationHistory(t *testing.T) {
 	// 进入 TLI 3 的切换点来自 parent=2 那行（0/9000060），不是更早的 1→2。
 	if fork.ForkLSN != "0/9000060" {
 		t.Errorf("应取 parent 最大的行的 LSN: %+v", fork)
+	}
+}
+
+// 超长单行（超过旧 bufio.Scanner 的 4MB 上限）不能再中断扫描——
+// 旧实现停在超长行，其后 WAL 全部不解析，覆盖还可能报 full（BUG-1 之 3）。
+func TestScanWaldumpHugeLineContinues(t *testing.T) {
+	huge := strings.Repeat("x", 5*1024*1024) // 5MB，超过旧 4MB 上限
+	in := "rmgr: Heap        len (rec/tot):     99/    99, tx:      701, lsn: 0/06000120, prev 0/06000100, desc: " + huge + "\n" +
+		"rmgr: Transaction        len (rec/tot):    54/    54, tx:      701, lsn: 0/06000180, prev 0/06000120, desc: COMMIT 2026-11-24 08:00:00.123456 UTC; inval messages: rec 0\n"
+	res := ScanWaldumpOutput(strings.NewReader(in), time.UTC, 16060, nil)
+	if _, ok := res.Commits[701]; !ok {
+		t.Fatal("超长行后面的 COMMIT 必须仍被解析（扫描不得中断）")
+	}
+}
+
+// 两阶段提交：COMMIT PREPARED 无提交时间戳，必须单独识别（BUG-3）。
+// 目标表 DML 不算孤儿，由调用方按"有变化"保守计入。
+func TestScanWaldumpCommitPrepared(t *testing.T) {
+	in := "rmgr: Heap        len (rec/tot):     99/    99, tx:      500, lsn: 0/06000120, prev 0/06000100, desc: INSERT off 72 flags 0x00, blkref #0: rel 1663/16060/19161 blk 2024\n" +
+		"rmgr: Transaction        len (rec/tot):    54/    54, tx:      500, lsn: 0/06000180, prev 0/06000120, desc: COMMIT PREPARED 500\n"
+	res := ScanWaldumpOutput(strings.NewReader(in), time.UTC, 16060, nil)
+	if !res.CommitsPrepared[500] {
+		t.Fatal("COMMIT PREPARED 应记入 CommitsPrepared")
+	}
+	if _, ok := res.Commits[500]; ok {
+		t.Fatal("COMMIT PREPARED 无时间戳，不应进常规 Commits")
+	}
+	if tx, dml := CountOrphans(res.DMLByTx, res.Commits, res.Aborted, res.CommitsPrepared); tx != 0 || dml != 0 {
+		t.Errorf("prepared 事务不算孤儿，got tx=%d dml=%d", tx, dml)
+	}
+}
+
+// ABORT PREPARED：已回滚的两阶段事务，DML 排除、也不算孤儿（reAbort 的 \b 命中）。
+func TestScanWaldumpAbortPrepared(t *testing.T) {
+	in := "rmgr: Heap        len (rec/tot):     99/    99, tx:      501, lsn: 0/06000120, prev 0/06000100, desc: INSERT off 1 flags 0x00, blkref #0: rel 1663/16060/19161 blk 2024\n" +
+		"rmgr: Transaction        len (rec/tot):    42/    42, tx:      501, lsn: 0/06000180, prev 0/06000120, desc: ABORT PREPARED 501\n"
+	res := ScanWaldumpOutput(strings.NewReader(in), time.UTC, 16060, nil)
+	if !res.Aborted[501] {
+		t.Fatal("ABORT PREPARED 应记入 Aborted")
+	}
+	if tx, _ := CountOrphans(res.DMLByTx, res.Commits, res.Aborted, res.CommitsPrepared); tx != 0 {
+		t.Errorf("已回滚的 prepared 事务不算孤儿")
+	}
+}
+
+// 覆盖降级：full 只在 waldump 干净退出、无段缺口、读取无中断时成立（BUG-1）。
+func TestFullCoverageBlocked(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        string
+		benign     bool
+		gaps       int
+		parseErrs  int
+		wantReason int
+	}{
+		{"全干净", "", false, 0, 0, 0},
+		{"读到末尾正常收尾", "exit 1 (tail)", true, 0, 0, 0},
+		{"中途异常退出", "waldump crashed", false, 0, 0, 1},
+		{"段缺口", "", false, 2, 0, 1},
+		{"读取中断", "", false, 0, 1, 1},
+		{"三重叠加", "err", false, 1, 1, 3},
+	}
+	for _, c := range cases {
+		got := FullCoverageBlocked(c.err, c.benign, c.gaps, c.parseErrs)
+		if len(got) != c.wantReason {
+			t.Errorf("%s: 期望 %d 条理由，got %d (%v)", c.name, c.wantReason, len(got), got)
+		}
+	}
+}
+
+// PreparedWarningText：有 prepared 才有文案。
+func TestPreparedWarningText(t *testing.T) {
+	if s := PreparedWarningText(map[uint32]bool{}); s != "" {
+		t.Errorf("空 prepared 应返回空串，got %q", s)
+	}
+	s := PreparedWarningText(map[uint32]bool{1: true, 2: true})
+	if !strings.Contains(s, "2 个两阶段提交") {
+		t.Errorf("文案应包含计数，got %q", s)
 	}
 }
